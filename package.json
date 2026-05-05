@@ -1,0 +1,16 @@
+{
+  "name": "framework-espidf",
+  "version": "5.5.2",
+  "description":"Custom ESP-IDF fork for PlatformIO that includes additional A2DP codecs ",
+  "keywords": [
+    "framework",
+    "espressif",
+    "esp32"
+  ],
+  "homepage": "https://github.com",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com.git"
+  }
+}
