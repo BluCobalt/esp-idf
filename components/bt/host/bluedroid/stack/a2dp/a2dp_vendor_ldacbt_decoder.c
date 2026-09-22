@@ -36,7 +36,7 @@ bool a2dp_ldac_decoder_init(decoded_data_callback_t decode_callback) {
 
     a2dp_ldac_decoder_cb.ldac_handle = hndl;
     a2dp_ldac_decoder_cb.has_ldac_handle = true;
-    a2dp_ldac_decoder_cb.pcm_fmt = LDACBT_SMPL_FMT_S32;
+    a2dp_ldac_decoder_cb.pcm_fmt = LDACBT_SMPL_FMT_S24;
     a2dp_ldac_decoder_cb.decode_callback = decode_callback;
     return true;
 }
@@ -72,50 +72,38 @@ bool a2dp_ldac_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf, size_t b
     int32_t in_count = p_buf->len;
     int32_t in_used = 0;
     int32_t used_bytes = 0;
-
     int32_t out_used = 0;
-    int32_t out_count = 0;
 
-    int result = 0;
-
-    /* Patched: Check buffer space BEFORE decoding to prevent overflow */
-    /* LDAC decodes 256 samples per frame, max 32-bit stereo = 2048 bytes */
-    const size_t max_frame_output = 256 * 4 * 2;
-
+    /* Per-frame decode + callback: decode each LDAC frame and immediately
+     * deliver PCM via callback. This reuses the same ~2KB of decode buffer
+     * per frame instead of accumulating all frames (up to 8KB for SQ mode).
+     * Benefits:
+     *  - Constant 2KB buffer usage regardless of quality mode
+     *  - Lower decode-to-playback latency
+     *  - No risk of decode buffer overflow
+     */
     while ((in_count - in_used) > 0) {
-        /* Check if we have room for at least one more decoded frame */
-        if ((size_t)(buf_len - out_count) < max_frame_output) {
-            LOG_WARN("%s: buffer nearly full, stopping decode.", __func__);
-            break;
-        }
-
-        result = ldacBT_decode(hndl,
+        int result = ldacBT_decode(hndl,
                                src + in_used,
-                               buf + out_count,
+                               buf,
                                a2dp_ldac_decoder_cb.pcm_fmt,
                                max_frame_size,
                                (int *)&used_bytes,
                                (int *)&out_used);
         in_used += used_bytes;
-        out_count += out_used;
 
-        if (result != 0 || used_bytes <= 0 || out_used <= 0) {
+        if (result != 0) {
+            LOG_ERROR("%s: decode error %d", __func__, result);
+            return false;
+        }
+        if (used_bytes <= 0 || out_used <= 0) {
             break;
         }
 
-        if (out_count > buf_len) {
-            LOG_ERROR("%s: buffer full.", __func__);
-            out_count = buf_len;
-            break;
-        }
+        /* Flush decoded frame immediately — only ~2KB per frame */
+        a2dp_ldac_decoder_cb.decode_callback(buf, out_used);
     }
 
-    if (result != 0) {
-        LOG_ERROR("%s: decode error. result = %d", __func__, result);
-        return false;
-    }
-
-    a2dp_ldac_decoder_cb.decode_callback(buf, out_count);
     return true;
 }
 
@@ -144,6 +132,10 @@ void a2dp_ldac_decoder_configure(const uint8_t* p_codec_info) {
         sf = 192000;
     }
     LOG_INFO("%s: LDAC Sampling frequency = %lu", __func__, sf);
+    if (sf == 0) {
+        APPL_TRACE_ERROR("%s: unsupported LDAC sample rate", __func__);
+        return;
+    }
 
 
     int cm = 0;
@@ -161,6 +153,11 @@ void a2dp_ldac_decoder_configure(const uint8_t* p_codec_info) {
 
     int res;
     HANDLE_LDAC_BT hndl = a2dp_ldac_decoder_cb.ldac_handle;
+    if (!a2dp_ldac_decoder_cb.has_ldac_handle || !hndl) {
+        APPL_TRACE_ERROR("%s: LDAC decoder handle unavailable", __func__);
+        a2dp_ldac_decoder_cb.has_ldac_handle = false;
+        return;
+    }
     res = ldacBT_init_handle_decode(hndl, cm, sf, 0, 0, 0);
     if (res < 0) {
         int err = ldacBT_get_error_code(hndl);

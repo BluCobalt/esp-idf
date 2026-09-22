@@ -1,4 +1,6 @@
 #include "ldac.h"
+DECLFUNC void free_decode_ldac(SFINFO* p_sfinfo);
+
 DECLFUNC LDAC_RESULT init_decode_ldac(SFINFO* p_sfinfo) {
   AB* p_ab;
   LDAC_RESULT result = LDAC_S_OK;
@@ -21,6 +23,10 @@ DECLFUNC LDAC_RESULT init_decode_ldac(SFINFO* p_sfinfo) {
       result = LDAC_E_FAIL;
       break;
     }
+  }
+  if (result != LDAC_S_OK) {
+    free_decode_ldac(p_sfinfo);
+    return result;
   }
 
   p_ab = (AB*)calloc_ldac(p_sfinfo, nbks, sizeof(AB));

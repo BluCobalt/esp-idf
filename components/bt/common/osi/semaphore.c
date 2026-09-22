@@ -72,6 +72,9 @@ osi_sem_take(osi_sem_t *sem, uint32_t timeout)
 // Deallocates a semaphore
 void osi_sem_free(osi_sem_t *sem)
 {
+    if (sem == NULL || *sem == NULL) {
+        return;
+    }
     vSemaphoreDelete(*sem);
     *sem = NULL;
 }

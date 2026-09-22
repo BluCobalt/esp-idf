@@ -265,7 +265,7 @@ bool A2DP_VendorBuildCodecConfigLdac(UINT8 *p_src_cap, UINT8 *p_result) {
     return false;
   }
 
-  // Modified to prefer higher sample rates (96kHz > 88.2kHz > 48kHz > 44.1kHz)
+  // Prefer LDAC high-resolution rates when the phone supports them.
   if (src_cap.sampleRate & A2DP_LDAC_SAMPLING_FREQ_96000) {
     pref_cap.sampleRate = A2DP_LDAC_SAMPLING_FREQ_96000;
   } else if (src_cap.sampleRate & A2DP_LDAC_SAMPLING_FREQ_88200) {

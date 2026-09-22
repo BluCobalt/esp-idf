@@ -143,12 +143,11 @@ void avct_l2c_connect_ind_cback(BD_ADDR bd_addr, UINT16 lcid, UINT16 psm, UINT8 
         /* transition to configuration state */
         p_lcb->ch_state = AVCT_CH_CFG;
 
-        /* Send L2CAP config req */
+        /* Send L2CAP config req — omit MTU for Realtek interop */
         memset(&cfg, 0, sizeof(tL2CAP_CFG_INFO));
-        cfg.mtu_present = TRUE;
-        cfg.mtu = avct_cb.mtu;
+        cfg.mtu_present = FALSE;
         L2CA_ConfigReq(lcid, &cfg);
-        AVCT_TRACE_DEBUG("avct_l2c snd Cfg Req");
+        AVCT_TRACE_DEBUG("avct_l2c snd Cfg Req (no MTU)");
     }
 
 #if (BT_USE_TRACES == TRUE)
@@ -184,12 +183,11 @@ void avct_l2c_connect_cfm_cback(UINT16 lcid, UINT16 result)
                 /* set channel state */
                 p_lcb->ch_state = AVCT_CH_CFG;
 
-                /* Send L2CAP config req */
+                /* Send L2CAP config req — omit MTU for Realtek interop */
                 memset(&cfg, 0, sizeof(tL2CAP_CFG_INFO));
-                cfg.mtu_present = TRUE;
-                cfg.mtu = avct_cb.mtu;
+                cfg.mtu_present = FALSE;
                 L2CA_ConfigReq(lcid, &cfg);
-                AVCT_TRACE_DEBUG("avct_l2c snd Cfg Req");
+                AVCT_TRACE_DEBUG("avct_l2c snd Cfg Req (no MTU)");
             }
             /* else failure */
             else {

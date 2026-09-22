@@ -1351,7 +1351,10 @@ void bta_av_sig_chg(tBTA_AV_DATA *p_data)
                     p_lcb->lidx = xx + 1;
                     bdcpy(p_lcb->addr, p_data->str_msg.bd_addr);
                     p_lcb->conn_msk = 0; /* clear the connect mask */
-                    /* start listening when the signal channel is open */
+                    /* Re-enabled: AVRCP acceptor is needed so Windows routes
+                     * audio.  The L2CAP security bypass for PSM 0x0017 prevents
+                     * the config stall that previously motivated disabling this.
+                     */
                     if (p_cb->features & BTA_AV_FEAT_RCTG) {
                         bta_av_rc_create(p_cb, AVCT_ACP, 0, p_lcb->lidx);
                     }
@@ -1692,13 +1695,35 @@ void bta_av_rc_disc_done(tBTA_AV_DATA *p_data)
                     ((p_cb->features & BTA_AV_FEAT_RCTG) && (peer_features & BTA_AV_FEAT_RCCT))) ) {
                 p_lcb = bta_av_find_lcb(p_scb->peer_addr, BTA_AV_LCB_FIND);
                 if (p_lcb) {
-                    rc_handle = bta_av_rc_create(p_cb, AVCT_INT, (UINT8)(p_scb->hdi + 1), p_lcb->lidx);
-                    p_cb->rcb[rc_handle].peer_features = peer_features;
-                    p_cb->rcb[rc_handle].peer_ct_features = peer_ct_features;
-                    p_cb->rcb[rc_handle].peer_tg_features = peer_tg_features;
+                    /* If an ACP (acceptor) AVRC listener exists, the peer may have
+                     * already opened an incoming AVCTP connection whose AVRC_OPEN
+                     * event is still queued.  Pre-fill the ACP RCB with the SDP
+                     * features so that bta_av_rc_opened() won't redundantly restart
+                     * SDP — which confuses Realtek (and similar) stacks into
+                     * disconnecting/reconnecting AVCTP in a loop.
+                     * Only fall through to create an outgoing INT connection when
+                     * there is no ACP listener at all. */
+                    if (p_cb->rc_acp_handle != BTA_AV_RC_HANDLE_NONE && p_cb->rc_acp_idx > 0) {
+                        UINT8 acp_rcb_idx = p_cb->rc_acp_idx - 1;
+                        APPL_TRACE_DEBUG("rc_disc_done: ACP handle %d exists, "
+                                         "store features 0x%x on ACP RCB[%d] "
+                                         "instead of creating outgoing INT",
+                                         p_cb->rc_acp_handle, peer_features, acp_rcb_idx);
+                        p_cb->rcb[acp_rcb_idx].peer_features = peer_features;
+                        p_cb->rcb[acp_rcb_idx].peer_ct_features = peer_ct_features;
+                        p_cb->rcb[acp_rcb_idx].peer_tg_features = peer_tg_features;
 #if BTA_AV_CA_INCLUDED
-                    p_cb->rcb[rc_handle].cover_art_l2cap_psm = obex_l2cap_psm;
+                        p_cb->rcb[acp_rcb_idx].cover_art_l2cap_psm = obex_l2cap_psm;
 #endif
+                    } else {
+                        rc_handle = bta_av_rc_create(p_cb, AVCT_INT, (UINT8)(p_scb->hdi + 1), p_lcb->lidx);
+                        p_cb->rcb[rc_handle].peer_features = peer_features;
+                        p_cb->rcb[rc_handle].peer_ct_features = peer_ct_features;
+                        p_cb->rcb[rc_handle].peer_tg_features = peer_tg_features;
+#if BTA_AV_CA_INCLUDED
+                        p_cb->rcb[rc_handle].cover_art_l2cap_psm = obex_l2cap_psm;
+#endif
+                    }
                 }
 #if (BT_USE_TRACES == TRUE || BT_TRACE_APPL == TRUE)
                 else {

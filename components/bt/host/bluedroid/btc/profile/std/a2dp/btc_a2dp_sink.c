@@ -28,6 +28,7 @@
 #include "btc/btc_manage.h"
 #include "btc_av.h"
 #include "btc/btc_util.h"
+#include "stack/a2dp_codec_api.h"
 #include "esp_a2dp_api.h"
 #include "oi_status.h"
 #include "osi/future.h"
@@ -36,11 +37,14 @@
 
 #if (BTC_AV_SINK_INCLUDED == TRUE)
 
-#if (defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE)
-#define BT_A2DP_SINK_BUF_SIZE   (64*1024)
-#else
-#define BT_A2DP_SINK_BUF_SIZE   (64*1024)
-#endif
+/* Decode scratch is allocated per selected codec. AAC has its own decoder
+ * output storage and does not need this shared buffer at all. */
+#define BT_A2DP_SINK_BUF_SBC        (1024)
+#define BT_A2DP_SINK_BUF_LDAC       (2048)
+#define BT_A2DP_SINK_BUF_APTX       (4*1024)
+#define BT_A2DP_SINK_BUF_OPUS       (4*2000)
+#define BT_A2DP_SINK_BUF_LC3PLUS    (4*1024)
+#define BT_A2DP_SINK_BUF_DEFAULT    (4*1024)
 
 /*****************************************************************************
  **  Constants
@@ -80,24 +84,23 @@ enum {
    but due to link flow control or thread preemption in lower
    layers we might need to temporarily buffer up data */
 
-/* Increased from 25 to 150 to handle SPIFFS write/delete stalls during flash erase
-   150 frames is equivalent to ~600ms of buffering at 44.1kHz
-   This prevents packet drops when SPIFFS operations block the CPU */
-#define MAX_OUTPUT_A2DP_SNK_FRAME_QUEUE_SZ     (150)
+/* Queue depth: 14 entries balances jitter absorption vs RAM.
+ * LDAC at 96kHz HQ: ~700 bytes/pkt × 14 = ~9.8KB peak queue.
+ * Provides ~75ms LDAC / ~200ms SBC buffering — sufficient for
+ * BT link jitter without starving the heap. */
+#define MAX_OUTPUT_A2DP_SNK_FRAME_QUEUE_SZ     (24)
 
 #define BTC_A2DP_SNK_DATA_QUEUE_IDX            (1)
 
 #define A2DP_TASK_NAME                   "A2DP_DECODER"
-#if CONFIG_SPIRAM
-#define A2DP_TASK_STACK_SIZE             (50 * 1024)
-#else
-#define A2DP_TASK_STACK_SIZE             (BTC_TASK_STACK_SIZE)
-#endif
+/* 4KB is sufficient for all codecs (SBC, aptX, LDAC, Opus, LC3plus).
+ * Decoders use pre-allocated static context, not deep stack recursion. */
+#define A2DP_TASK_STACK_SIZE             (8192)
 #define A2DP_TASK_PRIO                   (BT_TASK_MAX_PRIORITIES - 6)
 #define A2DP_TASK_PINNED_TO_CORE         (1)
 #define A2DP_TASK_WORKQUEUE_NUM          (2)
 #define A2DP_TASK_WORKQUEUE0_LEN         (1)
-#define A2DP_TASK_WORKQUEUE1_LEN         (5)
+#define A2DP_TASK_WORKQUEUE1_LEN         (4)
 
 typedef struct {
     uint32_t sig;
@@ -120,6 +123,9 @@ typedef struct {
     osi_thread_t        *btc_aa_snk_task_hdl;
     const tA2DP_DECODER_INTERFACE* decoder;
     unsigned char *decode_buf;  // Allocated from internal RAM
+    size_t decode_buf_len;
+    btav_a2dp_codec_index_t codec_index;
+    BOOLEAN decoder_ready;
     // a2dp_sink_media_pkt_seq_num_t   media_pkt_seq_num;
 } a2dp_sink_local_param_t;
 
@@ -150,6 +156,118 @@ static a2dp_sink_local_param_t a2dp_sink_local_param;
 static a2dp_sink_local_param_t *a2dp_sink_local_param_ptr;
 #define a2dp_sink_local_param (*a2dp_sink_local_param_ptr)
 #endif ///A2D_DYNAMIC_MEMORY == FALSE
+
+static size_t btc_a2dp_sink_decode_buf_size(btav_a2dp_codec_index_t codec_index)
+{
+    switch (codec_index) {
+    case BTAV_A2DP_CODEC_INDEX_SINK_SBC:
+        return BT_A2DP_SINK_BUF_SBC;
+#if (defined(AAC_DEC_INCLUDED) && AAC_DEC_INCLUDED == TRUE)
+    case BTAV_A2DP_CODEC_INDEX_SINK_AAC:
+        return 0;
+#endif
+#if (defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE)
+    case BTAV_A2DP_CODEC_INDEX_SINK_APTX:
+    case BTAV_A2DP_CODEC_INDEX_SINK_APTX_HD:
+    case BTAV_A2DP_CODEC_INDEX_SINK_APTX_LL:
+        return BT_A2DP_SINK_BUF_APTX;
+#endif
+#if (defined(LDAC_DEC_INCLUDED) && LDAC_DEC_INCLUDED == TRUE)
+    case BTAV_A2DP_CODEC_INDEX_SINK_LDAC:
+        return BT_A2DP_SINK_BUF_LDAC;
+#endif
+#if (defined(OPUS_DEC_INCLUDED) && OPUS_DEC_INCLUDED == TRUE)
+    case BTAV_A2DP_CODEC_INDEX_SINK_OPUS:
+    case BTAV_A2DP_CODEC_INDEX_SINK_OPUS_ANDROID:
+        return BT_A2DP_SINK_BUF_OPUS;
+#endif
+#if (defined(LC3PLUS_DEC_INCLUDED) && LC3PLUS_DEC_INCLUDED == TRUE)
+    case BTAV_A2DP_CODEC_INDEX_SINK_LC3PLUS:
+        return BT_A2DP_SINK_BUF_LC3PLUS;
+#endif
+    default:
+        return BT_A2DP_SINK_BUF_DEFAULT;
+    }
+}
+
+static UINT8 btc_a2dp_sink_queue_limit(void)
+{
+    switch (a2dp_sink_local_param.codec_index) {
+#if (defined(AAC_DEC_INCLUDED) && AAC_DEC_INCLUDED == TRUE)
+    case BTAV_A2DP_CODEC_INDEX_SINK_AAC:
+        return 18;
+#endif
+#if (defined(LDAC_DEC_INCLUDED) && LDAC_DEC_INCLUDED == TRUE)
+    case BTAV_A2DP_CODEC_INDEX_SINK_LDAC:
+        return 20;
+#endif
+    case BTAV_A2DP_CODEC_INDEX_SINK_SBC:
+        return 18;
+    default:
+        return 18;
+    }
+}
+
+static UINT8 btc_a2dp_sink_queue_floor(void)
+{
+    switch (a2dp_sink_local_param.codec_index) {
+#if (defined(AAC_DEC_INCLUDED) && AAC_DEC_INCLUDED == TRUE)
+    case BTAV_A2DP_CODEC_INDEX_SINK_AAC:
+        return 8;
+#endif
+#if (defined(LDAC_DEC_INCLUDED) && LDAC_DEC_INCLUDED == TRUE)
+    case BTAV_A2DP_CODEC_INDEX_SINK_LDAC:
+        return 8;
+#endif
+    case BTAV_A2DP_CODEC_INDEX_SINK_SBC:
+        return 8;
+    default:
+        return 8;
+    }
+}
+
+static size_t btc_a2dp_sink_pressure_target(void)
+{
+    switch (a2dp_sink_local_param.codec_index) {
+#if (defined(AAC_DEC_INCLUDED) && AAC_DEC_INCLUDED == TRUE)
+    case BTAV_A2DP_CODEC_INDEX_SINK_AAC:
+        return 10 * 1024;
+#endif
+#if (defined(LDAC_DEC_INCLUDED) && LDAC_DEC_INCLUDED == TRUE)
+    case BTAV_A2DP_CODEC_INDEX_SINK_LDAC:
+        return 6 * 1024;
+#endif
+    default:
+        return 6 * 1024;
+    }
+}
+
+static BOOLEAN btc_a2dp_sink_configure_decode_buf(size_t required_len)
+{
+    if (a2dp_sink_local_param.decode_buf_len == required_len &&
+        (required_len == 0 || a2dp_sink_local_param.decode_buf != NULL)) {
+        return TRUE;
+    }
+
+    if (a2dp_sink_local_param.decode_buf) {
+        osi_free(a2dp_sink_local_param.decode_buf);
+        a2dp_sink_local_param.decode_buf = NULL;
+        a2dp_sink_local_param.decode_buf_len = 0;
+    }
+
+    if (required_len == 0) {
+        return TRUE;
+    }
+
+    a2dp_sink_local_param.decode_buf = (unsigned char *)osi_malloc(required_len);
+    if (!a2dp_sink_local_param.decode_buf) {
+        APPL_TRACE_ERROR("%s: failed to allocate %u byte decode buffer",
+                         __func__, (unsigned)required_len);
+        return FALSE;
+    }
+    a2dp_sink_local_param.decode_buf_len = required_len;
+    return TRUE;
+}
 
 void btc_a2dp_sink_reg_data_cb(esp_a2d_sink_data_cb_t callback)
 {
@@ -188,8 +306,6 @@ static void btc_a2dp_sink_ctrl(void *param)
         APPL_TRACE_ERROR("%s: p_buf is null", __func__);
         return;
     }
-
-    uint32_t sig = p_buf->event;
 
     switch (p_buf->event) {
     case BTC_MEDIA_TASK_SINK_INIT:
@@ -234,15 +350,7 @@ bool btc_a2dp_sink_startup(void)
     APPL_TRACE_EVENT("## A2DP SINK START MEDIA THREAD ##");
 
     const size_t workqueue_len[] = {A2DP_TASK_WORKQUEUE0_LEN, A2DP_TASK_WORKQUEUE1_LEN};
-#if CONFIG_SPIRAM
-    a2dp_sink_local_param.btc_aa_snk_task_hdl = osi_thread_create_psram(
-                                    A2DP_TASK_NAME,
-                                    A2DP_TASK_STACK_SIZE,
-                                    A2DP_TASK_PRIO,
-                                    A2DP_TASK_PINNED_TO_CORE,
-                                    A2DP_TASK_WORKQUEUE_NUM,
-                                    workqueue_len);
-#else
+    /* Always use internal RAM for task stack - no PSRAM */
     a2dp_sink_local_param.btc_aa_snk_task_hdl = osi_thread_create(
                                     A2DP_TASK_NAME,
                                     A2DP_TASK_STACK_SIZE,
@@ -250,7 +358,6 @@ bool btc_a2dp_sink_startup(void)
                                     A2DP_TASK_PINNED_TO_CORE,
                                     A2DP_TASK_WORKQUEUE_NUM,
                                     workqueue_len);
-#endif
 
     if(!a2dp_sink_local_param.btc_aa_snk_task_hdl) {
         APPL_TRACE_ERROR("%s unable to create a2dp task\n", __func__);
@@ -294,14 +401,15 @@ void btc_a2dp_sink_shutdown(void)
     // Exit thread
     btc_a2dp_sink_state = BTC_A2DP_SINK_STATE_SHUTTING_DOWN;
 
-    osi_thread_free(a2dp_sink_local_param.btc_aa_snk_task_hdl);
-
+    /* Post cleanup BEFORE freeing the thread so it actually runs */
     BT_HDR *p_buf = (BT_HDR*)osi_malloc(sizeof(BT_HDR));
     if (p_buf) {
         p_buf->event = BTC_MEDIA_TASK_SINK_CLEAN_UP;
         osi_thread_post(a2dp_sink_local_param.btc_aa_snk_task_hdl,
                         btc_a2dp_sink_ctrl, p_buf, 0, OSI_THREAD_MAX_TIMEOUT);
     }
+
+    osi_thread_free(a2dp_sink_local_param.btc_aa_snk_task_hdl);
 
     APPL_TRACE_EVENT("## A2DP SINK MEDIA THREAD STARTED ##\n");
 
@@ -451,7 +559,7 @@ static void btc_a2dp_sink_data_ready(UNUSED_ATTR void *context)
         }
 
         btc_a2dp_sink_handle_inc_media(p_msg);
-        /* p_msg is allocated with osi_malloc() in btc_a2dp_sink_enque_buf() */
+        /* p_msg is the original BT packet (zero-copy enqueue) */
         osi_free(p_msg);
         nb_of_msgs_to_process--;
     }
@@ -474,9 +582,25 @@ static void btc_a2dp_sink_data_ready(UNUSED_ATTR void *context)
 static void btc_a2dp_sink_handle_decoder_reset(tBTC_MEDIA_SINK_CFG_UPDATE *p_msg)
 {
     const tA2DP_DECODER_INTERFACE* decoder = A2DP_GetDecoderInterface(p_msg->codec_info);
+    btav_a2dp_codec_index_t codec_index = A2DP_SinkCodecIndex(p_msg->codec_info);
     if (!decoder) {
         APPL_TRACE_ERROR("%s: Couldn't get decoder for codec %s", __func__,
                          A2DP_CodecName(p_msg->codec_info));
+        a2dp_sink_local_param.decoder_ready = FALSE;
+        a2dp_sink_local_param.btc_aa_snk_cb.rx_flush = TRUE;
+        return;
+    }
+
+    a2dp_sink_local_param.decoder_ready = FALSE;
+    a2dp_sink_local_param.btc_aa_snk_cb.rx_flush = TRUE;
+    if (a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ) {
+        btc_a2dp_sink_flush_q(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
+    }
+
+    size_t decode_buf_len = btc_a2dp_sink_decode_buf_size(codec_index);
+    if (!btc_a2dp_sink_configure_decode_buf(decode_buf_len)) {
+        a2dp_sink_local_param.decoder_ready = FALSE;
+        a2dp_sink_local_param.btc_aa_snk_cb.rx_flush = TRUE;
         return;
     }
 
@@ -491,6 +615,7 @@ static void btc_a2dp_sink_handle_decoder_reset(tBTC_MEDIA_SINK_CFG_UPDATE *p_msg
         if (a2dp_sink_local_param.decoder->decoder_init &&
             !a2dp_sink_local_param.decoder->decoder_init(btc_a2d_data_cb_to_app)) {
             APPL_TRACE_ERROR("%s: Decoder failed to initialize", __func__);
+            a2dp_sink_local_param.decoder = NULL;
             return;
         }
     } else {
@@ -502,6 +627,14 @@ static void btc_a2dp_sink_handle_decoder_reset(tBTC_MEDIA_SINK_CFG_UPDATE *p_msg
     if (a2dp_sink_local_param.decoder->decoder_configure){
         a2dp_sink_local_param.decoder->decoder_configure(p_msg->codec_info);
     }
+    a2dp_sink_local_param.codec_index = codec_index;
+    a2dp_sink_local_param.decoder_ready = TRUE;
+    a2dp_sink_local_param.btc_aa_snk_cb.rx_flush = FALSE;
+    APPL_TRACE_EVENT("%s: codec=%s scratch=%u queue_limit=%u pressure_target=%u",
+                     __func__, A2DP_CodecName(p_msg->codec_info),
+                     (unsigned)a2dp_sink_local_param.decode_buf_len,
+                     (unsigned)btc_a2dp_sink_queue_limit(),
+                     (unsigned)btc_a2dp_sink_pressure_target());
 }
 
 /*******************************************************************************
@@ -519,6 +652,16 @@ static void btc_a2dp_sink_handle_inc_media(BT_HDR *p_msg)
     /* XXX: Check if the below check is correct, we are checking for peer to be sink when we are sink */
     if (btc_av_get_peer_sep() == AVDT_TSEP_SNK || (a2dp_sink_local_param.btc_aa_snk_cb.rx_flush)) {
         APPL_TRACE_DEBUG(" State Changed happened in this tick ");
+        return;
+    }
+
+    if (a2dp_sink_local_param.decoder_ready == FALSE || !a2dp_sink_local_param.decoder) {
+        APPL_TRACE_WARNING("%s: dropping media packet before decoder is ready", __func__);
+        return;
+    }
+
+    if (a2dp_sink_local_param.decode_buf_len != 0 && !a2dp_sink_local_param.decode_buf) {
+        APPL_TRACE_WARNING("%s: dropping media packet because decode buffer is unavailable", __func__);
         return;
     }
 
@@ -548,7 +691,7 @@ static void btc_a2dp_sink_handle_inc_media(BT_HDR *p_msg)
 
     if (a2dp_sink_local_param.decoder->decode_packet) {
         unsigned char* buf = a2dp_sink_local_param.decode_buf;
-        size_t buf_len = BT_A2DP_SINK_BUF_SIZE;
+        size_t buf_len = a2dp_sink_local_param.decode_buf_len;
         a2dp_sink_local_param.decoder->decode_packet(p_msg, buf, buf_len);
     }
 }
@@ -607,46 +750,54 @@ static void btc_a2dp_sink_rx_flush(void)
  ** Returns          size of the queue
  *******************************************************************************/
 
-/* Threshold for proactive memory pressure relief (bytes of free internal RAM)
- * Lowered from 32KB to 24KB to reduce unnecessary packet drops during decoding */
-#define MEMORY_PRESSURE_THRESHOLD_KB    24
-
 UINT8 btc_a2dp_sink_enque_buf(BT_HDR *p_pkt)
 {
-    BT_HDR *p_msg;
-
     if (btc_a2dp_sink_state != BTC_A2DP_SINK_STATE_ON){
         osi_free(p_pkt);  /* Free original - caller expects us to take ownership */
         return 0;
     }
 
-    if (a2dp_sink_local_param.btc_aa_snk_cb.rx_flush == TRUE) { /* Flush enabled, do not enque*/
+    if (!a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ ||
+        !a2dp_sink_local_param.btc_aa_snk_cb.data_ready_event) {
+        osi_free(p_pkt);
+        return 0;
+    }
+
+    if (a2dp_sink_local_param.btc_aa_snk_cb.rx_flush == TRUE ||
+        a2dp_sink_local_param.decoder_ready == FALSE) { /* Flush enabled, do not enque*/
         osi_free(p_pkt);  /* Free original - caller expects us to take ownership */
         return fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
     }
 
-    if (fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ) >= MAX_OUTPUT_A2DP_SNK_FRAME_QUEUE_SZ) {
-        APPL_TRACE_WARNING("Pkt dropped\n");
+    UINT8 queue_limit = btc_a2dp_sink_queue_limit();
+    if (fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ) >= queue_limit) {
+        APPL_TRACE_WARNING("Pkt dropped, codec queue full (%u)\n", (unsigned)queue_limit);
         osi_free(p_pkt);  /* Free original - caller expects us to take ownership */
         return fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
     }
 
-    /* Proactive memory pressure check - if internal RAM is getting low,
-     * flush some buffers BEFORE we hit critical allocation failures.
-     * This keeps the HCI layer healthy during high-bandwidth streaming. */
-    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (free_internal < (MEMORY_PRESSURE_THRESHOLD_KB * 1024)) {
-        /* Low memory - drop oldest packets from queue to make room */
-        int queue_len = fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
-        if (queue_len > 10) {
-            /* Drop half the queue to recover quickly */
-            int to_drop = queue_len / 2;
-            APPL_TRACE_WARNING("Low memory (%u KB free), dropping %d oldest packets", 
-                             (unsigned)(free_internal / 1024), to_drop);
-            for (int i = 0; i < to_drop; i++) {
-                void *buf = fixed_queue_dequeue(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ, 0);
-                if (buf) {
-                    osi_free(buf);
+    /* Proactive memory pressure check — only every 32 packets  to avoid
+     * the overhead of heap_caps_get_free_size (spinlock + metadata walk)
+     * on every incoming BT packet.  At typical A2DP rates (~50 pkt/s)
+     * this still checks roughly twice per second. */
+    {
+        static uint8_t enq_counter = 0;
+        if ((++enq_counter & 0x1F) == 0) {
+            size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            size_t pressure_target = btc_a2dp_sink_pressure_target();
+            if (free_internal < pressure_target) {
+                int queue_len = fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
+                int queue_floor = btc_a2dp_sink_queue_floor();
+                if (queue_len > queue_floor) {
+                    int to_drop = queue_len - queue_floor;
+                    APPL_TRACE_WARNING("Low memory (%u bytes free, target %u), dropping %d oldest packets",
+                                     (unsigned)free_internal, (unsigned)pressure_target, to_drop);
+                    for (int i = 0; i < to_drop; i++) {
+                        void *buf = fixed_queue_dequeue(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ, 0);
+                        if (buf) {
+                            osi_free(buf);
+                        }
+                    }
                 }
             }
         }
@@ -654,34 +805,33 @@ UINT8 btc_a2dp_sink_enque_buf(BT_HDR *p_pkt)
 
     APPL_TRACE_DEBUG("btc_a2dp_sink_enque_buf + ");
 
-    /* allocate and Queue this buffer in internal RAM */
-    size_t alloc_size = sizeof(BT_HDR) + p_pkt->offset + p_pkt->len;
-    p_msg = (BT_HDR *) osi_malloc(alloc_size);
-    if (p_msg != NULL) {
-        memcpy(p_msg, p_pkt, alloc_size);
-        /* Non-blocking: never stall the BT stack thread. If the queue is full,
-         * drop this packet rather than blocking and causing stutter.
-         */
-        if (!fixed_queue_enqueue(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ, p_msg, 0)) {
-            osi_free(p_msg);
-            osi_free(p_pkt);
-            return fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
-        }
-        osi_thread_post_event(a2dp_sink_local_param.btc_aa_snk_cb.data_ready_event, 0);
-        /* Free original packet from lower layer after making our copy */
+    /* Zero-copy enqueue: pass the original packet directly to the queue
+     * instead of malloc+memcpy+free. The packet was allocated with osi_malloc
+     * by the HCI/L2CAP layer, so osi_free works on the decode side.
+     * This eliminates one malloc+free per packet and avoids transient
+     * double-allocation spikes that cause OOM during LDAC streaming. */
+    if (!fixed_queue_enqueue(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ, p_pkt, 0)) {
         osi_free(p_pkt);
-    } else {
-        /* let caller deal with a failed allocation */
-        APPL_TRACE_WARNING("btc_a2dp_sink_enque_buf No Buffer left - ");
-        /* Allocation failed: still free original to avoid leaking lower-layer packet */
-        osi_free(p_pkt);
+        return fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
     }
+    osi_thread_post_event(a2dp_sink_local_param.btc_aa_snk_cb.data_ready_event, 0);
     return fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
 }
 
 static void btc_a2dp_sink_handle_clear_track (void)
 {
     APPL_TRACE_DEBUG("%s", __FUNCTION__);
+
+    /* Do not clean up the decoder here.
+     * Some phones briefly disconnect/reconnect while changing codecs and can
+     * deliver the new codec config before the idle/clear-track event is handled.
+     * Clearing the decoder here leaves the subsequent STARTED stream muted until
+     * a full reconnect. The decoder is safely replaced in decoder_reset() and
+     * freed during media-thread cleanup.
+     */
+    if (a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ) {
+        btc_a2dp_sink_flush_q(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
+    }
 }
 
 /*******************************************************************************
@@ -707,6 +857,10 @@ static void btc_a2dp_sink_thread_init(UNUSED_ATTR void *context)
 {
     APPL_TRACE_EVENT("%s\n", __func__);
     memset(&a2dp_sink_local_param.btc_aa_snk_cb, 0, sizeof(a2dp_sink_local_param.btc_aa_snk_cb));
+    a2dp_sink_local_param.decoder_ready = FALSE;
+    a2dp_sink_local_param.decode_buf = NULL;
+    a2dp_sink_local_param.decode_buf_len = 0;
+    a2dp_sink_local_param.codec_index = BTAV_A2DP_CODEC_INDEX_MAX;
 
     btc_a2dp_sink_state = BTC_A2DP_SINK_STATE_ON;
 
@@ -716,9 +870,6 @@ static void btc_a2dp_sink_thread_init(UNUSED_ATTR void *context)
     a2dp_sink_local_param.btc_aa_snk_cb.data_ready_event = data_event;
 
     a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ = fixed_queue_new(QUEUE_SIZE_MAX);
-
-    a2dp_sink_local_param.decode_buf = (unsigned char *)osi_malloc(BT_A2DP_SINK_BUF_SIZE);
-    assert(a2dp_sink_local_param.decode_buf != NULL);
 
     btc_a2dp_control_init();
 }
@@ -730,6 +881,7 @@ static void btc_a2dp_sink_thread_cleanup(UNUSED_ATTR void *context)
         a2dp_sink_local_param.decoder->decoder_cleanup();
         a2dp_sink_local_param.decoder = NULL;
     }
+    a2dp_sink_local_param.decoder_ready = FALSE;
 
     btc_a2dp_control_set_datachnl_stat(FALSE);
     /* Clear task flag */
@@ -749,6 +901,8 @@ static void btc_a2dp_sink_thread_cleanup(UNUSED_ATTR void *context)
         osi_free(a2dp_sink_local_param.decode_buf);
         a2dp_sink_local_param.decode_buf = NULL;
     }
+    a2dp_sink_local_param.decode_buf_len = 0;
+    a2dp_sink_local_param.codec_index = BTAV_A2DP_CODEC_INDEX_MAX;
 }
 
 /*******************************************************************************
@@ -767,6 +921,7 @@ void btc_a2dp_sink_on_memory_pressure(void)
 {
     /* Log memory pressure event with current state */
     size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    (void)free_internal;
     
     APPL_TRACE_WARNING("%s: Memory pressure! Internal RAM: %u bytes free, sink_state=%d", 
                        __func__, (unsigned)free_internal, btc_a2dp_sink_state);
@@ -782,6 +937,7 @@ void btc_a2dp_sink_on_memory_pressure(void)
     /* Directly flush the queue - don't post a message since we're low on memory */
     if (a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ != NULL) {
         int queue_len = fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
+        (void)queue_len;
         APPL_TRACE_WARNING("%s: Queue has %d packets", __func__, queue_len);
         
         int flushed = 0;
@@ -799,8 +955,10 @@ void btc_a2dp_sink_on_memory_pressure(void)
         APPL_TRACE_WARNING("%s: RxSbcQ is NULL!", __func__);
     }
     
-    /* Re-enable rx after a short delay - let memory stabilize */
-    a2dp_sink_local_param.btc_aa_snk_cb.rx_flush = FALSE;
+    /* Re-enable rx only if a decoder is configured. */
+    if (a2dp_sink_local_param.decoder_ready == TRUE) {
+        a2dp_sink_local_param.btc_aa_snk_cb.rx_flush = FALSE;
+    }
 }
 
 /*******************************************************************************
@@ -822,15 +980,3 @@ UINT8 btc_a2dp_sink_get_queue_depth(void)
 }
 
 #endif /* BTC_AV_SINK_INCLUDED */
-
-
-
-
-
-
-
-
-
-
-
-

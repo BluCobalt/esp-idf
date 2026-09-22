@@ -164,7 +164,6 @@ bool a2dp_sbc_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf, size_t bu
     UINT32 src_len;
     size_t num_frames;
     OI_INT16 *dst;
-    INT32 avail;
     UINT32 written;
     OI_STATUS status;
     int count;
@@ -176,13 +175,11 @@ bool a2dp_sbc_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf, size_t bu
     src = data + sizeof(struct sbc_header);
     src_len = p_buf->len - sizeof(struct sbc_header);
 
-    dst = (OI_INT16*)buf;
-    avail = buf_len;
-
     APPL_TRACE_DEBUG("Number of sbc frames %d, frame_len %d\n", num_frames, src_len);
 
-    for (count = 0; count < num_frames && src_len != 0 && avail > 0; count ++) {
-        written = avail;
+    for (count = 0; count < num_frames && src_len != 0; count ++) {
+        written = buf_len;  /* Reset available space each frame */
+        dst = (OI_INT16*)buf;  /* Reset output position to start of buffer */
         status = OI_CODEC_SBC_DecodeFrame(&a2dp_sbc_decoder_cb.decoder_context,
                                           (const OI_BYTE **)&src,
                                           (OI_UINT32 *)&src_len,
@@ -192,16 +189,15 @@ bool a2dp_sbc_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf, size_t bu
             APPL_TRACE_ERROR("Decoding failure: %d\n", status);
             return false;
         }
-        avail -= written;
-        dst += written / 2;
+        /* Deliver each decoded frame immediately via callback */
+        if (written > 0) {
+            a2dp_sbc_decoder_cb.decode_callback((uint8_t*)buf, written);
+        }
     }
 
     p_buf->offset = p_buf->offset + p_buf->len - src_len;
     p_buf->len = src_len;
 
-    size_t out_used = buf_len - avail;
-    out_used = out_used <= buf_len ? out_used : buf_len;
-    a2dp_sbc_decoder_cb.decode_callback((uint8_t*)buf, out_used);
     return true;
 }
 

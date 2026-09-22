@@ -409,7 +409,7 @@ static void process_l2cap_cmd (tL2C_LCB *p_lcb, UINT8 *p, UINT16 pkt_len)
             break;
         }
 
-        L2CAP_TRACE_DEBUG ("cmd_code: %d, id:%d, cmd_len:%d", cmd_code, id, cmd_len);
+        L2CAP_TRACE_WARNING ("L2CAP SIG RX cmd_code: %d, id:%d, cmd_len:%d", cmd_code, id, cmd_len);
 
         /* Bad L2CAP packet length, look or cmd to reject */
         if (pkt_size_rej) {
@@ -672,10 +672,20 @@ static void process_l2cap_cmd (tL2C_LCB *p_lcb, UINT8 *p, UINT16 pkt_len)
                     STREAM_TO_UINT32 (cfg_info.ext_flow_spec.access_latency, p);
                     STREAM_TO_UINT32 (cfg_info.ext_flow_spec.flush_timeout, p);
                     break;
+
+                default:
+                    L2CAP_TRACE_WARNING ("L2CAP - ConfigRsp unknown option: 0x%02x len:%d", cfg_code, cfg_len);
+                    p += cfg_len;
+                    break;
                 }
             }
 
+            L2CAP_TRACE_WARNING ("L2CAP - ConfigRsp for CID: 0x%04x result:%d flags:0x%04x mtu_present:%d",
+                                 lcid, cfg_info.result, cfg_info.flags, cfg_info.mtu_present);
+
             if ((p_ccb = l2cu_find_ccb_by_cid (p_lcb, lcid)) != NULL) {
+                L2CAP_TRACE_WARNING ("L2CAP - ConfigRsp CCB found, local_id:%d pkt_id:%d state:%d",
+                                     p_ccb->local_id, id, p_ccb->chnl_state);
                 if (p_ccb->local_id != id) {
                     L2CAP_TRACE_WARNING ("L2CAP - cfg rsp - bad ID. Exp: %d Got: %d",
                                          p_ccb->local_id, id);

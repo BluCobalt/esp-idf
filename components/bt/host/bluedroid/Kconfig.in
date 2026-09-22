@@ -150,7 +150,6 @@ config BT_A2DP_AAC_DECODER
     bool "AAC decoder"
     depends on BT_A2DP_ENABLE
     default n
-    select SPIRAM
     help
         A2DP AAC decoder
 
