@@ -74,7 +74,7 @@ void a2dp_aptx_decoder_cleanup(void) {
     }
 
     aptx_finish(decoder_context);
-    decoder_context = NULL;
+    a2dp_aptx_decoder_cb.decoder_context = NULL;
 }
 
 bool a2dp_aptx_decoder_reset(void) {
@@ -107,7 +107,19 @@ bool a2dp_aptx_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf, size_t b
     int32_t avail = buf_len;
 
     size_t processed = -1;
-    while (src_size > 0 && avail > 0 && processed) {
+    while (src_size > 0 && processed) {
+        /* Flush buffer via callback when nearly full to prevent overflow.
+         * aptX has ~8x expansion ratio, so a 700-byte packet can produce
+         * ~5.6KB of PCM. We flush in buffer-sized batches. */
+        if (avail < 256) {
+            size_t len = buf_len - avail;
+            if (len > 0) {
+                a2dp_aptx_decoder_cb.decode_callback((uint8_t*)buf, len);
+            }
+            dst = buf;
+            avail = buf_len;
+        }
+
         size_t written;
         processed = aptx_decode32(decoder_context, src, (size_t)src_size, dst, (size_t)avail, &written);
 
@@ -120,13 +132,11 @@ bool a2dp_aptx_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf, size_t b
         p_buf->len -= processed;
     }
 
-    if (src_size > 0 && avail <= 0) {
-        LOG_ERROR("%s: Insufficient output buffer size. %d bytes remain.", __func__, src_size);
-    }
-
+    /* Flush remaining decoded data */
     size_t len = buf_len - avail;
-    len = len <= buf_len ? len : buf_len;
-    a2dp_aptx_decoder_cb.decode_callback((uint8_t*)buf, len);
+    if (len > 0) {
+        a2dp_aptx_decoder_cb.decode_callback((uint8_t*)buf, len);
+    }
     return true;
 }
 

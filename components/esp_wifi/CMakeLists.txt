@@ -38,6 +38,7 @@ if(CONFIG_ESP_WIFI_ENABLED OR CONFIG_ESP_HOST_WIFI_ENABLED)
         "src/wifi_default.c"
         "src/wifi_netif.c"
         "src/wifi_default_ap.c"
+        "src/esp_wifi_ecast.c"
         "${idf_target}/esp_adapter.c")
 
 

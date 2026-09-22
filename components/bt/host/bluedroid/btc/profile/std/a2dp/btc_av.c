@@ -1437,8 +1437,7 @@ static void bte_av_media_callback(tBTA_AV_EVT event, tBTA_AV_MEDIA *p_data)
 
     if (event == BTA_AV_MEDIA_DATA_EVT) { /* Switch to BTC_MEDIA context */
         state = btc_sm_get_state(btc_av_cb.sm_handle);
-        if ( (state == BTC_AV_STATE_STARTED) || /* send SBC packets only in Started State */
-                (state == BTC_AV_STATE_OPENED) ) {
+        if (state == BTC_AV_STATE_STARTED) {
             que_len = btc_a2dp_sink_enque_buf((BT_HDR *)p_data);
             BTC_TRACE_DEBUG(" Packets in Que %d\n", que_len);
         } else {

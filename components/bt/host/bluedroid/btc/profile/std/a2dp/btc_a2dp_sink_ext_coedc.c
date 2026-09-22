@@ -29,7 +29,7 @@
 
 #if (BTC_AV_SINK_INCLUDED == TRUE) && (BTC_AV_EXT_CODEC == TRUE)
 
-#define MAX_OUTPUT_A2DP_SNK_FRAME_QUEUE_SZ     (25)
+#define MAX_OUTPUT_A2DP_SNK_FRAME_QUEUE_SZ     (14)
 #define BTC_A2DP_SNK_DATA_QUEUE_IDX            (1)
 
 enum {

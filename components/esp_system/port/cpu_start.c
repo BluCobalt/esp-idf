@@ -291,20 +291,20 @@ static void start_other_core(void)
 
     ESP_EARLY_LOGD(TAG, "Starting app cpu, entry point is %p", call_start_cpu1);
 
+    // Enable clock and reset APP CPU. Note that OpenOCD may have already
+    // enabled clock and taken APP CPU out of reset. In this case don't reset
+    // APP CPU again, as that will clear the breakpoints which may have already
+    // been set.
+    ets_set_appcpu_boot_addr((uint32_t)call_start_cpu1);
+
+    cpu_utility_ll_enable_clock_and_reset_app_cpu();
+
 #if CONFIG_IDF_TARGET_ESP32 && !CONFIG_APP_BUILD_TYPE_PURE_RAM_APP
     Cache_Flush(1);
     Cache_Read_Enable(1);
 #endif // #if CONFIG_IDF_TARGET_ESP32 && !CONFIG_APP_BUILD_TYPE_PURE_RAM_APP
 
     esp_cpu_unstall(1);
-
-    // Enable clock and reset APP CPU. Note that OpenOCD may have already
-    // enabled clock and taken APP CPU out of reset. In this case don't reset
-    // APP CPU again, as that will clear the breakpoints which may have already
-    // been set.
-    cpu_utility_ll_enable_clock_and_reset_app_cpu();
-
-    ets_set_appcpu_boot_addr((uint32_t)call_start_cpu1);
 
     bool cpus_up = false;
 
